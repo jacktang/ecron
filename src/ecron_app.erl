@@ -51,22 +51,16 @@
 %% @end
 %%------------------------------------------------------------------------------
 start(_Type, _Args) ->
-    case mnesia:wait_for_tables([?JOB_TABLE, ?JOB_COUNTER],10000) of
-        ok ->
-            {ok, Pid} = ecron_sup:start_link(),
-            case application:get_env(ecron, event_handlers) of
-                undefined      -> EH = [];
-                {ok, Handlers} -> EH = Handlers
-            end,
-            lists:foreach(
-              fun({Handler, Args}) ->
-                      {ok, _} = ecron_event_sup:start_handler(Handler, Args)
-              end, EH),
-            {ok, Pid};
-        Error ->
-            Error
-    end.    
-
+    {ok, Pid} = ecron_sup:start_link(),
+    case application:get_env(ecron, event_handlers) of
+        undefined      -> EH = [];
+        {ok, Handlers} -> EH = Handlers
+    end,
+    lists:foreach(
+      fun({Handler, Args}) ->
+              {ok, _} = ecron_event_sup:start_handler(Handler, Args)
+      end, EH),
+    {ok, Pid}.
 
 %%------------------------------------------------------------------------------
 %% @spec stop(_Args) -> Result

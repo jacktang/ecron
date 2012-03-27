@@ -48,7 +48,12 @@
 %% @end
 %%------------------------------------------------------------------------------
 start_link() ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    Cronfile =
+        case application:get_env(ecron, ecronfile) of
+            undefined -> undefined;
+            {ok, C} -> C
+        end,
+    supervisor:start_link({local, ?MODULE}, ?MODULE, [ecron_sup, Cronfile]).
 
 
 %%==============================================================================
@@ -63,12 +68,12 @@ start_link() ->
 %% maximum restart frequency and child specifications. 
 %% @end
 %%------------------------------------------------------------------------------
-init(_Args) ->
+init([ecron_sup, Cronfile]) ->
     EventManager = {?EVENT_MANAGER,
                     {gen_event, start_link, [{local, ?EVENT_MANAGER}]},
                     permanent, 10000, worker, [dynamic]},
 
-    Ecron = {ecron_server, {ecron, start_link, []},
+    Ecron = {ecron_server, {ecron, start_link, [Cronfile]},
               permanent, 10000, worker, [ecron]},
 
     EventSup = {ecron_event_sup,

@@ -5,7 +5,8 @@
   {vsn, git},
   {registered, []},
   {mod, {ecron_app, []}},
-  {applications, [kernel, stdlib, mnesia]},
+  {applications, [kernel, stdlib]},
   {build_dependencies, []},
-  {env, [{event_handlers,[{ecron_event, []}]}]}
+  {env, [{event_handlers,[{ecron_event, []}]},
+         {ecronfile, "ecron.job"}]}
  ]}.
