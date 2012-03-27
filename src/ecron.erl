@@ -166,11 +166,9 @@
 -behaviour(gen_server).
 
 %% API
--export([install/0,
-         install/1,
-         start/0,
+-export([start/0,
          stop/0,
-         start_link/0,
+         start_link/1,
          insert/2,
          insert/4,
          list/0,
@@ -191,8 +189,10 @@
     		 terminate/2,
          code_change/3]).
 
--export([execute_job/2,
+-export([execute_job/1,
          create_add_job/1]).
+
+-record(state, {cronfile, ecrontab, timer, next_job}).
 
 -include("ecron.hrl").
 
@@ -209,7 +209,7 @@ start() ->
         ok ->
             io:format("~p started, ~p seconds~n",[?APPLICATION, Secs]),
             ok;
-        {error, {already_started, mnesia}} ->
+        {error, {already_started, ecron}} ->
             io:format("~p already started, ~p seconds~n",[?APPLICATION, Secs]),
             ok;
         {error, R} ->
@@ -229,39 +229,8 @@ stop() ->
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
-
-%%------------------------------------------------------------------------------
-%% @spec install() -> ok
-%% @doc Create mnesia tables on those nodes where disc_copies resides according
-%% to the schema. <br/>
-%% Before starting the `ecron' application
-%%  for the first time a new database must be created, `mnesia:create_schema/1
-%% ' and tables created by `ecron:install/0' or
-%%  `ecron:install/1'<br/>
-%% E.g. <br/>
-%% <pre>
-%% >mnesia:create_schema([node()]).
-%% >mnesia:start().
-%% >ecron:install().
-%% </pre>
-%% @end
-%%------------------------------------------------------------------------------
-install() ->
-    install(mnesia:table_info(schema,disc_copies)).
-
-%%------------------------------------------------------------------------------
-%% @spec install(Nodes) -> ok
-%% @doc Create mnesia tables on Nodes.
-%% @end
-%%------------------------------------------------------------------------------
-install(Nodes) ->
-    create_table(?JOB_COUNTER, [{disc_copies, Nodes}]),
-    create_table(?JOB_TABLE, [{type, ordered_set},
-                              {attributes, record_info(fields, job)},
-                              {disc_copies, Nodes}]).
+start_link(Cronfile) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [Cronfile], []).
 
 %%------------------------------------------------------------------------------
 %% @spec add_event_handler(Handler, Args) -> {ok, Pid} | {error, Reason}
@@ -343,8 +312,8 @@ list_event_handlers() ->
 %% Returns `{error, Reason}' if invalid parameters have been passed.
 %% @end
 %%------------------------------------------------------------------------------
-insert({Date, Time} = _DateTime, MFA) ->
-    insert({Date, Time}, MFA, undefined, undefined).
+insert(Time, MFA) ->
+    insert(Time, MFA, undefined, undefined).
 
 %%------------------------------------------------------------------------------
 %% @spec insert(DateTime, MFA, Retry, RetrySeconds) -> ok
@@ -373,20 +342,10 @@ insert({Date, Time} = _DateTime, MFA) ->
 %%      times at interval of RetrySeconds.
 %% @end
 %%------------------------------------------------------------------------------
-insert({Date, Time} = _DateTime, MFA, Retry, Seconds) ->
-    case validate(Date, Time) of
-        ok ->
-            DueSec = sec({Date, Time}),
-            DueTime = calendar:gregorian_seconds_to_datetime(DueSec),
-            Key = {DueSec, mnesia:dirty_update_counter(?JOB_COUNTER, job,1)},
-            Job = #job{key = Key,
-                       mfa = {MFA, DueTime},
-                       schedule = {Date, Time},
-                       retry = {Retry, Seconds}},
-            gen_server:cast(?MODULE, {insert, Job});
-        Error ->
-            Error
-    end.
+insert({_SS, _MM, _HH, _D, _M, _Y, _W} = ScheduleTime, MFA, Retry, Seconds) ->
+    gen_server:call(?MODULE, {insert, ScheduleTime, MFA, Retry, Seconds});
+insert(_, _, _, _) ->
+    {error, invalid_args}.
 
 
 %% @spec list() -> JobList
@@ -451,7 +410,8 @@ print_list() ->
       fun(Job) ->
               #job{key = {ExecSec, Id},
                    schedule = Schedule,
-                   mfa = {MFA, DueDateTime},
+                   mfa = MFA,
+                   due_to = DueDateTime,
                    retry = {RetryTimes, Seconds},
                    client_fun = Fun
                   } = Job,
@@ -505,7 +465,7 @@ execute_all() ->
 %% @end
 %%------------------------------------------------------------------------------
 delete(ID) ->
-    gen_server:cast(?MODULE, {delete, ID}).
+    gen_server:call(?MODULE, {delete, ID}).
 
 %%------------------------------------------------------------------------------
 %% @spec delete_all() -> ok
@@ -525,28 +485,10 @@ delete_all() ->
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-init(_Args) ->
-    NewScheduled =
-        case application:get_env(ecron, scheduled) of
-            undefined     -> [];
-            {ok, MFAList} -> MFAList
-        end,
-    OldScheduled = mnesia:activity(async_dirty,
-        fun() ->
-                Objs = mnesia:select(?JOB_TABLE,
-                                 [{#job{_ = '_'},
-                                   [], ['$_']}]),
-                {atomic, ok} = mnesia:clear_table(?JOB_TABLE),
-                Objs
-        end),
-    Scheduled = remove_duplicated(NewScheduled, OldScheduled, OldScheduled),
-    lists:foreach(fun create_add_job/1, Scheduled),
-    case mnesia:dirty_first(?JOB_TABLE) of
-        {DueSec, _} ->
-            {ok, [], get_timeout(DueSec)};
-        '$end_of_table' ->
-            {ok, []}
-    end.
+init([Cronfile]) ->
+    Ecrontab = ets:new(ecrontab, [ordered_set, protected, named_table, {keypos, #job.key}]),
+    self() ! load,
+    {ok, #state{cronfile = Cronfile, ecrontab = Ecrontab}}.
 %%------------------------------------------------------------------------------
 %% @spec handle_info(Info, State) -> {noreply, State} |
 %%                                    {noreply, State, Timeout} |
@@ -555,16 +497,44 @@ init(_Args) ->
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-handle_info(timeout, State) ->
-    case mnesia:dirty_first(?JOB_TABLE) of
-        '$end_of_table' ->
-            {noreply, State};
-        K ->
-            check_job(K, State)
-    end;
+handle_info(load, #state{ecrontab = Ecrontab, cronfile = Cronfile} = State) ->
+    case load(Ecrontab, Cronfile) of
+        {ok, _} ->
+            ok;
+        {error, Reason} ->
+            error_logger:error_msg("[~p] load from cronfile ~p failed ~p~n", [?MODULE, Cronfile, Reason])
+    end,
+    NState = reschedule(State),
+    {noreply, NState};
 
-handle_info(_, State) ->
-    case mnesia:dirty_first(?JOB_TABLE) of
+handle_info({execute, #job{key = Key, schedule = Schedule, due_to = DueTo} =  Job},
+            #state{ecrontab = Ecrontab} = State) ->
+    ets:delete(Ecrontab, Key),
+    case ecron_time:match_date(DueTo, Schedule) of
+        true ->
+            spawn(?MODULE, execute_job, [Job]);
+        false ->
+            ok
+    end,
+    NJob = update_job(DueTo, Job),
+    #job{due_to = NextDueTo} = NJob,
+    case is_not_retried(Job) of
+        true ->
+            case ecron_time:expired(NextDueTo, Schedule) of
+                true ->
+                    ok;
+                false ->
+                    ets:insert(Ecrontab, NJob)
+            end;
+        false ->
+            ok
+    end,
+    NState = reschedule(State),
+    {noreply, NState};
+    
+
+handle_info(_, #state{ecrontab = Ecrontab} = State) ->
+    case ets:first(Ecrontab) of
         {DueSec, _} ->
             {reply, ok, State, get_timeout(DueSec)};
         '$end_of_table' ->
@@ -578,19 +548,38 @@ handle_info(_, State) ->
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-handle_call(list, _From, State) ->
-    Keys = mnesia:dirty_all_keys(?JOB_TABLE),
-    Jobs = lists:map(fun(Key) ->
-                     [J] =  mnesia:dirty_read(?JOB_TABLE, Key),
-                      J
-                     end, Keys),
-    case Keys of
-        [] ->
-            {reply, Jobs, State};
-        Keys ->
-            {DueSec, _} = hd(Keys),
-            {reply, Jobs, State, get_timeout(DueSec)}
-    end.
+handle_call({insert, ScheduleTime, MFA, Retry, Seconds}, _From, #state{ecrontab = Ecrontab} = State) ->
+    Reply = 
+        case add_job(ScheduleTime, MFA, Retry, Seconds) of
+            {ok, #job{key = {_, MRef}} = Job} ->
+                ets:insert(Ecrontab, Job),
+                {ok, MRef};
+            {error, Reason} ->
+                {error, Reason}
+        end,
+    NState = reschedule(State),
+    {reply, Reply, NState};
+
+handle_call({delete, MRef}, _From, #state{ecrontab = Ecrontab} = State) ->
+    Reply = 
+        case ets:match_object(Ecrontab, #job{key = {'_', MRef}, _ = '_'}) of
+            [Job] ->
+                ets:delete_object(Ecrontab, Job),
+                {ok, ok};
+            [] ->
+                {error, noref}
+        end,
+    NState = reschedule(State),
+    {reply, Reply, NState};
+
+handle_call(load, _From, #state{ecrontab = Ecrontab, cronfile = Cronfile} = State) ->
+    Reply = load(Ecrontab, Cronfile),
+    NState = reschedule(State),
+    {reply, Reply, NState};
+
+handle_call(list, _From, #state{ecrontab = Ecrontab} = State) ->
+    Jobs = ets:tab2list(Ecrontab),
+    {reply, Jobs, State}.
 
 %%------------------------------------------------------------------------------
 %% @spec handle_cast(Msg, State) -> {noreply, State} |
@@ -600,62 +589,30 @@ handle_call(list, _From, State) ->
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-handle_cast({insert, Job}, State) ->
-    ok = mnesia:dirty_write(Job),
-    {DueSec, _} = mnesia:dirty_first(?JOB_TABLE),
-    {noreply, State, get_timeout(DueSec)};
+handle_cast({insert, Job}, #state{ecrontab = Ecrontab} = State) ->
+    ets:insert(Ecrontab, Job),
+    NState = reschedule(State),
+    {noreply, NState};
 
-handle_cast({delete, {_, _} = Key}, State) ->
-    ok = mnesia:dirty_delete(?JOB_TABLE, Key),
-    case mnesia:dirty_first(?JOB_TABLE) of
-        {DueSec, _} ->
-            {noreply, State, get_timeout(DueSec)};
-        '$end_of_table' ->
-            {noreply, State}
-    end;
+handle_cast({delete, {_, _} = Key}, #state{ecrontab = Ecrontab} = State) ->
+    ets:delete(Ecrontab, Key),
+    NState = reschedule(State),
+    {noreply, NState};
 
-handle_cast({delete, ID}, State) ->
-    ok = mnesia:activity(async_dirty,
-        fun() ->
-                case mnesia:select(?JOB_TABLE,
-                                   [{#job{key = {'_', ID}, _='_'},
-                                     [], ['$_']}]) of
-                    [] ->
-                        ok;
-                    [Obj] ->
-                        ok = mnesia:delete_object(Obj)
-                end
-        end),
-    case mnesia:dirty_first(?JOB_TABLE) of
-        {DueSec, _} ->
-            {noreply, State, get_timeout(DueSec)};
-        '$end_of_table' ->
-            {noreply, State}
-    end;
+handle_cast({delete, Id}, #state{ecrontab = Ecrontab} = State) ->
+    case ets:match_object(Ecrontab, #job{key = {'_', Id}, _ = '_'}) of
+        [Job] ->
+            ets:delete_object(Job);
+        [] ->
+            ok
+    end,
+    NState = reschedule(State),
+    {noreply, NState};
 
-handle_cast(delete, State) ->
-    {atomic, ok} = mnesia:clear_table(?JOB_TABLE),
-    {noreply, State};
-
-handle_cast(execute_all, State) ->
-    Scheduled = mnesia:activity(async_dirty,
-        fun() ->
-                Objs = mnesia:select(?JOB_TABLE,
-                                 [{#job{_ = '_'},
-                                   [], ['$_']}]),
-                {atomic, ok} = mnesia:clear_table(?JOB_TABLE),
-                Objs
-        end),
-    lists:foreach(fun(Job) ->
-                          NoRetryJob = Job#job{retry={undefined, undefined}},
-                          spawn(?MODULE, execute_job, [NoRetryJob, false])
-                  end, Scheduled),
-    case mnesia:dirty_first(?JOB_TABLE) of
-        {DueSec, _} ->
-            {noreply, State, get_timeout(DueSec)};
-        '$end_of_table' ->
-            {noreply, State}
-    end;
+handle_cast(delete, #state{ecrontab = Ecrontab} = State) ->
+    ets:delete_all_objects(Ecrontab),
+    NState = reschedule(State),
+    {noreply, NState};
 
 handle_cast(refresh, State) ->
     {atomic, ok} = mnesia:clear_table(?JOB_TABLE),
@@ -698,18 +655,110 @@ terminate(_Reason, _State) ->
 %% @end
 %%------------------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
-    case mnesia:dirty_first(?JOB_TABLE) of
-        {DueSec, _} ->
-            {ok, State, get_timeout(DueSec)};
-        '$end_of_table' ->
-            {ok, State}
-    end.
-
-
+    {ok, State}.
 
 %%==============================================================================
 %% Internal functions
 %%==============================================================================
+
+load(Ecrontab, Cronfile) ->
+    case load(Cronfile) of
+        {ok, Jobs} ->
+            ets:delete_all_objects(Ecrontab),
+            MRefs = 
+                lists:map(
+                  fun(#job{key = {_, MRef}} = Job) ->
+                          ets:insert(Ecrontab, Job),
+                          MRef
+                  end, Jobs),
+            {ok, MRefs};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+load([]) ->
+    {ok, []};
+load(undefined) ->
+    {ok, []};
+load(CronFile) ->
+    case filelib:is_regular(CronFile) of
+        true ->
+            case file:consult(CronFile) of
+                {ok, Terms} ->
+                    {Jobs, Errors} = 
+                        lists:foldl(
+                          fun(Term, {J, E}) ->
+                                  case Term of
+                                      {ScheduleTime, MFA} ->
+                                          case add_job(ScheduleTime, MFA, undefined, undefined) of
+                                              {ok, Job} ->
+                                                  {[Job|J], E};
+                                              {error, Reason} ->
+                                                  {J, [{Term, Reason}|E]}
+                                          end;
+                                      {ScheduleTime, MFA, Retry, Seconds}  ->
+                                          case add_job(ScheduleTime, MFA, Retry, Seconds) of
+                                              {ok, Job} ->
+                                                  {[Job|J], E};
+                                              {error, Reason} ->
+                                                  {J, [{Term, Reason}|E]}
+                                          end;
+                                      _ ->
+                                          {J, [{Term, invalid_argnum}|E]}
+                                  end
+                          end, {[], []}, Terms),
+                    case Errors of
+                        [] ->
+                            {ok, Jobs};
+                        _ ->
+                            {error, Errors}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        false ->
+            {error, not_exists}
+    end.
+                          
+
+update_job(CurrentTime, #job{schedule = ScheduleTime} = Job) ->
+    DueSec = ecron_time:next_sec(CurrentTime, ScheduleTime),
+    DueTime = calendar:gregorian_seconds_to_datetime(DueSec),
+    MRef = make_ref(),
+    Key = {DueSec, MRef},
+    Job#job{key = Key, due_to = DueTime}.
+
+add_job(ScheduleTime, MFA, Retry, Seconds) ->
+    try ecron_time:validate(ScheduleTime) of
+        true ->
+            Job = #job{schedule = ScheduleTime, mfa = MFA, retry = {Retry, Seconds}},
+            NJob = update_job(ecron_time:localtime(), Job),
+            {ok, NJob}
+    catch
+        throw:Reason ->
+            {error, Reason};
+        Class:Exception ->
+            erlang:raise(Class, Exception, erlang:get_stacktrace())
+    end.
+
+reschedule(#state{ecrontab = Ecrontab, timer = Timer} = State) ->
+    case ets:first(Ecrontab) of
+        '$end_of_table' ->
+            cancel_timer(Timer),
+            State#state{timer = undefined, next_job = undefined};
+        Key ->
+            [#job{key = {DueSec, _}} = Job] = ets:lookup(Ecrontab, Key),
+            Sec = get_timeout(DueSec),
+            cancel_timer(Timer),
+            NTimer = erlang:send_after(Sec, self(), {execute, Job}),
+            State#state{timer = NTimer, next_job = Job}
+    end.
+
+cancel_timer(Timer) when is_reference(Timer) ->
+    erlang:cancel_timer(Timer);
+cancel_timer(undefined) ->
+    ok.
+
 sec() ->
     calendar:datetime_to_gregorian_seconds(ecron_time:localtime()).
 sec({'*', Time}) ->
@@ -772,38 +821,14 @@ get_real_day(_, _, Day) ->
     Day.
 
 %%------------------------------------------------------------------------------
-%% @spec check_job(Key, State) -> {noreply, State} | {noreply, State, Timeout}
-%% @doc Checks if there's a job to execute in the table, extracts it and runs it
-%% @private
-%% @end
-%%------------------------------------------------------------------------------
-check_job({Due, _} = K, State)->
-    case Due - sec() of
-        Diff when Diff =< 0 ->
-            [Job] = mnesia:dirty_read(?JOB_TABLE, K),
-            ok = mnesia:dirty_delete(?JOB_TABLE, K),
-            NeedReschedule = is_not_retried(Job),
-            spawn(?MODULE, execute_job, [Job, NeedReschedule]),
-            case mnesia:dirty_first(?JOB_TABLE) of
-                '$end_of_table' ->
-                    {noreply, State};
-                K1->
-                    check_job(K1, State)
-            end;
-        _Diff ->
-            {noreply, State, get_timeout(Due)}
-    end.
-
-%%------------------------------------------------------------------------------
 %% @spec execute_job(Job, Reschedule) -> ok
 %% @doc Used internally. Execute the given Job. Reschedule it in case of a
 %%      periodic job, or in case the date is in the future.
 %% @private
 %% @end
 %%------------------------------------------------------------------------------
-execute_job(#job{client_fun = undefined, mfa = {{M, F, A}, DueTime},
-                 retry = {RetryTimes, Interval}, schedule = Schedule},
-	    Reschedule) ->
+execute_job(#job{client_fun = undefined, mfa = {M, F, A}, due_to = DueTime,
+                 retry = {RetryTimes, Interval}, schedule = Schedule}) ->
     ExecutionTime = ecron_time:localtime(),
     try apply(M, F, A) of
         {apply, Fun} when is_function(Fun, 0) ->
@@ -829,17 +854,12 @@ execute_job(#job{client_fun = undefined, mfa = {{M, F, A}, DueTime},
         _:Error ->
             notify(
 	      {mfa_result, Error, {Schedule, {M, F, A}}, DueTime, ExecutionTime})
-    end,
-    case Reschedule of
-        true  -> insert(Schedule, {M, F, A}, RetryTimes, Interval);
-        false -> ok
     end;
 
-
 execute_job(#job{client_fun = {Fun, DueTime},
-		 mfa = {MFA, _},
-		 schedule = Schedule,
-                 retry = Retry}, _) ->
+                 mfa = MFA,
+                 schedule = Schedule,
+                 retry = Retry}) ->
     execute_fun(Fun, Schedule, MFA, DueTime, Retry).
 
 %%------------------------------------------------------------------------------
@@ -892,13 +912,14 @@ retry(MFA, Fun, Schedule, {RetryTime, Seconds}, DueTime) ->
     notify({retry, {Schedule, MFA}, Fun, DueTime}),
     Now = sec(),
     DueSec = Now + Seconds,
-    Key = {DueSec, mnesia:dirty_update_counter({job_counter, job},1)},
+    Key = {DueSec, make_ref()},
     case Fun of
         undefined -> ClientFun = undefined;
         Fun       -> ClientFun = {Fun, DueTime}
     end,
     Job = #job{key = Key,
-               mfa = {MFA, DueTime},
+               mfa = MFA,
+               due_to = DueTime,
                schedule = Schedule,
                client_fun = ClientFun,
                retry = {RetryTime-1, Seconds}},
@@ -1010,37 +1031,6 @@ validate_time(_) ->
     false.
 
 
-%% return a lists of {Schedule,MFA} or {Schedule, MFA, RetryTimes, RetrySeconds}
-%% and #job{} where elements from the
-%% ScheduledMFAList are removed if they are present in the jobList
-remove_duplicated([], _, AccJobs) ->
-    AccJobs;
-remove_duplicated([{Schedule, MFA}|T], JobList, AccJobs) ->
-    case lists:any(fun(J) ->
-                           element(1,J#job.mfa)==MFA
-			       andalso J#job.schedule == Schedule
-			       andalso J#job.client_fun == undefined
-                   end, JobList) of
-        true ->
-	    %% The MFA was already present in the table
-	    remove_duplicated(T, JobList, AccJobs);
-        false ->
-	    remove_duplicated(T, JobList, [{Schedule, MFA}|AccJobs])
-    end;
-remove_duplicated([{Schedule, MFA, Retry, Sec}|T], JobList, AccJobs) ->
-    case lists:any(fun(J) ->
-                           element(1,J#job.mfa) == MFA
-			       andalso J#job.schedule == Schedule
-			       andalso J#job.client_fun == undefined
-			       andalso J#job.schedule == {Retry, Sec}
-                   end, JobList) of
-        true ->
-	    %% The MFA was already present in the table
-	    remove_duplicated(T, JobList, AccJobs);
-        false ->
-	    remove_duplicated(T, JobList, [{Schedule, MFA, Retry, Sec}|AccJobs])
-    end.
-
 get_timeout(DueSec) ->
     case DueSec - sec() of
         Diff when Diff =< 0      -> 5;
@@ -1049,13 +1039,9 @@ get_timeout(DueSec) ->
         Diff                     -> Diff*1000
     end.
 
-create_table(Table, Opts) ->
-    {atomic, ok} = mnesia:create_table(Table, Opts),
-    ok.
-
 %% Check whether it's the first attempt to execute a job and not a retried one
 is_not_retried(#job{client_fun = undefined, key = {DueSec, _},
-                mfa = {_, ExpectedDateTime}}) ->
+                due_to = ExpectedDateTime}) ->
     DueDateTime = calendar:gregorian_seconds_to_datetime(DueSec),
     DueDateTime == ExpectedDateTime;
 is_not_retried(_) ->

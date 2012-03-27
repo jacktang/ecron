@@ -3,3 +3,5 @@ ebin/
 .eunit/
 *~
 */*~
+test/*.beam
+*.dump

@@ -30,13 +30,14 @@
 %%% ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %%%-----------------------------------------------------------------------------
 -define(APPLICATION, ecron).
--define(JOB_TABLE, job).
+-define(JOB_TABLE, ecrontab).
 -define(JOB_COUNTER, job_counter).
 
 -define(EVENT_MANAGER, event_mngr).
 
 -record(job, {key,          %% {NextExecutionGregorianSeconds, Id}
-              mfa,          %% {MFA, DueDateTime}
+              mfa,          %% MFA
               schedule,     %% {Date, Time}
+              due_to,       %% DueDateTime
               client_fun,   %% {fun(), DueDateTime}
               retry}).      %% {RetryTimes, Seconds}
