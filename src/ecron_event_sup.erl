@@ -105,7 +105,6 @@ list_handlers() ->
 %% @end
 %%------------------------------------------------------------------------------
 init(_Args) ->
-  
     Child_Spec = [{ecron_event_handler_controller,
                    {ecron_event_handler_controller, start_link, []},
                    temporary, 5000, worker, 
