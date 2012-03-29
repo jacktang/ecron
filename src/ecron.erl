@@ -439,7 +439,7 @@ print_list() ->
 %% @end
 %%------------------------------------------------------------------------------
 refresh() ->
-    gen_server:cast(?MODULE, refresh).
+    gen_server:call(?MODULE, refresh, infinity).
 
 %%------------------------------------------------------------------------------
 %% @spec execute_all() -> ok
@@ -572,7 +572,7 @@ handle_call({delete, MRef}, _From, #state{ecrontab = Ecrontab} = State) ->
     NState = reschedule(State),
     {reply, Reply, NState};
 
-handle_call(load, _From, #state{ecrontab = Ecrontab, cronfile = Cronfile} = State) ->
+handle_call(refresh, _From, #state{ecrontab = Ecrontab, cronfile = Cronfile} = State) ->
     Reply = load(Ecrontab, Cronfile),
     NState = reschedule(State),
     {reply, Reply, NState};
