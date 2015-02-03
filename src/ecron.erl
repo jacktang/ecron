@@ -166,7 +166,9 @@
 -behaviour(gen_server).
 
 %% API
--export([install/0,
+-export([start/0,
+         stop/0,
+         install/0,
          install/1,
          start_link/0,
          insert/2,
@@ -186,17 +188,47 @@
          handle_call/3,
          handle_cast/2,
          handle_info/2,
-		 terminate/2,
+         terminate/2,
          code_change/3]).
 
 -export([execute_job/2,
          create_add_job/1]).
 
+-define(APPLICATION, ?MODULE).
 -include("ecron.hrl").
 
 %%==============================================================================
 %% API functions
 %%==============================================================================
+
+%%------------------------------------------------------------------------------
+%% @spec 
+%% @doc Start the server
+%% @end
+%%------------------------------------------------------------------------------
+start() ->
+    {Time , Res} =  timer:tc(application, start, [?APPLICATION, temporary]),
+    
+    Secs = Time div 1000000,
+    case Res of 
+        ok ->
+            io:format("~p started, ~p seconds~n",[?APPLICATION, Secs]),
+            ok;
+        {error, {already_started, mnesia}} ->
+            io:format("~p already started, ~p seconds~n",[?APPLICATION, Secs]),
+            ok;
+        {error, R} ->
+            io:format("~p failed to start, ~p seconds: ~p~n",[?APPLICATION, Secs, R]),
+            {error, R}
+    end.
+
+stop() ->
+    case application:stop(?APPLICATION) of
+        ok -> stopped;
+        {error, {not_started, ?APPLICATION}} -> stopped;
+        Other -> Other
+    end.
+
 
 %%------------------------------------------------------------------------------
 %% @spec start_link() -> {ok,Pid} | ignore | {error,Error}
